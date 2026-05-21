@@ -90,9 +90,12 @@ This is the most powerful pattern and the one most likely to trip you up. Analys
 - `llm`: Send document content to an LLM with a prompt and output schema. Returns structured JSON per document.
 - `vector_similarity`: Compute cosine similarity against a reference query. Returns `similarity_score` and `is_match`.
 
-**Two levels:**
-- `document` (default): One result per file. Uses the document summary. Required for collection enrichments.
-- `chunk`: One result per chunk (page/section). Use for finding specific passages, extracting per-page data, or when you need granular results.
+**Two modes:**
+
+- **Chunk-level (default — what you almost always want):** one LLM call per chunk reading the chunk's full native content. Required for finding passages, page-level Q&A, citations, or any question whose answer might live in a specific section. Source SQL must return `source_file_id, chunk_index` (typically `SELECT source_file_id, chunk_index FROM chunks WHERE ...`). Results live in `analysis_results_chunk`.
+- **Summary-only (`config.summary_only: true` — explicit opt-in):** one LLM call per file reading ONLY the document's overall summary. Much faster and cheaper, but BLIND to anything not surfaced in the summary. Use only for bulk classification, document-level labels, or screening questions answerable from a short summary — never for finding passages or evidence. Source SQL returns `source_file_id` only (`SELECT source_file_id FROM documents WHERE ...`). Results live in `analysis_results_doc`.
+
+When in doubt, omit `summary_only` — chunk-level is the safer default for legal workflows.
 
 **Analysis Can Be Pricey:**
 - Running analysis jobs can be pricey, especially as intelligence goes up. If you're not sure whether your prompt or intelligence level is sufficient, test against a smaller subset of docs and analyze results before processing the whole set.
@@ -199,15 +202,21 @@ Two paths to get there:
 
 You can stack multiple enrichments on the same collection — run a relevance job and a privilege job, enrich with both, then query for documents that are high-relevance AND non-privileged. Each job's results are namespaced independently, so enrichments never collide.
 
-**Document-level vs chunk-level enrichment:**
+**How enrichments surface on `collection_members`:**
 
-Enrichments on collection members are always document-level — one enrichment record per document per job. This works cleanly for document-level analysis jobs (one result per file maps directly to one collection item).
+Each row of `collection_members` exposes two enrichment columns, both materialized at read time by joining `analysis_results` through the collection's `linked_job_ids`:
 
-For chunk-level analysis jobs, results are **auto-aggregated** to document level when enriching: booleans are OR'd (becomes `any_X` — true if ANY chunk was true), numbers are MAX'd (becomes `max_X` — the highest value across chunks), and enums collapse by priority order. This means you lose per-chunk granularity in the enrichment itself.
+- `chunk_enrichments` (JSONB) — populated from chunk-level analysis jobs, keyed on `(source_file_id, chunk_index)`. One value per chunk row in chunk-level collections.
+- `document_enrichments` (JSONB) — populated from summary-only analysis jobs, keyed on `source_file_id`. The file's value applies to every row of that file (so on a chunk-level collection, all chunks of the same file share the same `document_enrichments`).
 
-**When you need chunk-level detail within a collection**, don't rely on the aggregated enrichments. Instead, query the `collection_analysis` view, which gives you the raw per-chunk analysis results scoped to that collection's documents. This preserves full granularity — which chunk, which page, what the analysis found there.
+Both columns are flat JSONB maps; access fields with `chunk_enrichments->>'field_name'` or `document_enrichments->>'field_name'`. Multiple linked jobs are merged into the same map (field-name collisions are rejected at link time, so each field has exactly one source job).
 
-The practical split: use `collection_members` with enrichments for document-level filtering and sorting ("show me the top 10 most relevant documents"). Use `collection_analysis` when you need passage-level precision ("show me the specific pages that mention the March inspection").
+**Grain compatibility rule:** chunk-level analysis jobs can be linked only to chunk-level collections (linking to a document-level collection would fan out one row per chunk — the API rejects it). Summary-only jobs can be linked to either grain.
+
+**Practical guidance:**
+- For passage-level filtering inside a chunk-level collection, query `chunk_enrichments`.
+- For document-level filtering or sorting on either grain, query `document_enrichments`.
+- For per-document aggregates of a chunk-level collection (one row per file with chunk count), use the `collection_documents` view.
 
 **Collection types:** `
 
