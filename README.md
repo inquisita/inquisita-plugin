@@ -28,11 +28,17 @@ The `inquisita-plugin` marketplace appears under **Personal**, and the Inquisita
 
 ![Plugin synced](./assets/screenshots/4-plugin-synced.png)
 
-### 5. Install the Inquisita connector
+### 5. Install the Inquisita plugin
+
+In the **Plugins** directory, find the **Inquisita** plugin and click the **+** icon to install it.
+
+![Install plugin](./assets/screenshots/5-install-plugin.png)
+
+### 6. Install the Inquisita connector
 
 Open the **Inquisita** plugin's **Connectors** tab and click **Install**. Sign in when prompted — Claude is now connected to Inquisita.
 
-![Install connector](./assets/screenshots/5-install-connector.png)
+![Install connector](./assets/screenshots/6-install-connector.png)
 
 > Installing the plugin alone does not connect the MCP. The connector must be installed from the plugin's settings as a second step — that's what registers Inquisita under **Connectors** and triggers sign-in.
 
