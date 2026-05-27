@@ -51,7 +51,7 @@ Pass `presigned_url=true` to get direct doc-viewing links you can share with the
 
 **Methods:** `llm` (LLM with prompt + output schema, returns structured JSON) or `vector_similarity` (cosine match against a reference query).
 
-**Levels:** `document` (one result per file, required for collection enrichments) or `chunk` (one per page/section, for passage-level extraction).
+**Two modes:** chunk-level (default — one LLM call per chunk, reads full native content; required for finding passages, citations, page-level Q&A) or summary-only (`config.summary_only: true` — one call per file reading only the document summary; faster/cheaper but blind to anything the summary omits; appropriate only for bulk classification or screening). When in doubt, omit `summary_only` and let chunk-level run.
 
 Analysis jobs cost real money — for large sets, test on a small subset and review results before processing the whole corpus.
 
@@ -73,7 +73,7 @@ Collections are persistent, shared, named document sets built from SQL (and opti
 
 Enriching a collection with one or more analysis jobs merges per-document results onto each member under a job-name namespace, making them queryable: `enrichments->'job_name'->>'field'`. Stack multiple enrichments (e.g., relevance + privilege) to power filtered views.
 
-Chunk-level analysis jobs auto-aggregate to document level when enriching a collection (booleans → `any_X`, numbers → `max_X`, enums collapse by priority). For per-chunk granularity inside a collection, query the `collection_analysis` view instead.
+Enrichments surface on `collection_members` in two columns: `chunk_enrichments` (from chunk-level jobs, per `(file, chunk_index)`) and `document_enrichments` (from summary-only jobs, per file — propagated to every chunk row of that file on chunk-level collections). Chunk-level jobs can only be linked to chunk-level collections; summary-only jobs link to either grain. For per-document aggregates of a chunk-level collection, use the `collection_documents` view.
 
 ### 5. Combined Analysis → Collection
 

@@ -74,7 +74,70 @@ Always call `inquisita_discover` first to see what views, columns, categories, a
 
 Semantic search is usually the best starting point. Keyword search is better for exact names, dates, or specific phrases.
 
-Queries can also be run with the presigned_url=true field to get presigned urls with every result. While docs can also be seen in the UI, this can be useful to provide your user with direct doc viewing links, or to build your own generative UI (In general generative UI takes significant tokens and time and should be avoided unless user requests. If using presigned urls in generative UIs or scripts, its best to save the output json and import it in your scripts/UI so you don't need to hard code them into your UI. 
+Queries can also be run with the presigned_url=true field to get presigned urls with every result. While docs can also be seen in the UI, this can be useful to provide your user with direct doc viewing links, or to build your own generative UI (In general generative UI takes significant tokens and time and should be avoided unless user requests. If using presigned urls in generative UIs or scripts, its best to save the output json and import it in your scripts/UI so you don't need to hard code them into your UI.
+
+**Reading whole documents is allowed — and often the right move.**
+
+For most legal tasks, reading the relevant documents end-to-end is what produces accurate output. Don't try to derive answers from summaries or clever SQL aggregations alone. To pull a doc's full content:
+
+```sql
+-- Whole document, in chunk order. If large, the host will spill it to disk —
+-- read the spill and proceed.
+SELECT chunk_index, text_content FROM chunks
+WHERE source_file_id = 'doc_X' ORDER BY chunk_index;
+
+-- A section of one document
+SELECT chunk_index, text_content FROM chunks
+WHERE source_file_id = 'doc_X' AND chunk_index BETWEEN 5 AND 15;
+```
+
+After you've identified the relevant docs for your task, just read them. The database is not "expensive grep" — it's a workspace. Reading a contract end-to-end is exactly what an attorney would do.
+
+**Triage helpers — use when picking which docs to read.**
+
+For a matter with many docs of different shapes, you'll need a triage step before reading every doc. Use `overall_summary` and a few targeted queries to narrow down:
+
+```sql
+-- Which docs mention specific terms (proper nouns, decision numbers, dates) from the task prompt
+SELECT documents.file_name,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%TERM_1%') AS hits_1,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%TERM_2%') AS hits_2
+FROM chunks JOIN documents USING (source_file_id)
+GROUP BY documents.file_name;
+
+-- Or one full-text-search sweep across the matter
+SELECT DISTINCT source_file_id, file_name FROM chunks
+JOIN documents USING (source_file_id)
+WHERE search_text @@ websearch_to_tsquery('"TERM_1" OR "TERM_2"');
+
+-- Snippet extraction when you only want a quote, not the whole doc
+SELECT source_file_id, chunk_index,
+       substring(text_content, GREATEST(1, position('term' in lower(text_content)) - 200), 600) AS snippet
+FROM chunks WHERE text_content ILIKE '%term%' LIMIT 50;
+```
+
+**Caveat on `overall_summary`:** the summary captures what a doc is "about" at a high level. It usually doesn't surface specific named witnesses, dollar amounts, or quoted phrases buried in the body. When the rubric expects named-entity findings (a particular witness's testimony, a specific dollar figure, an exact quote), you'll need to look at the chunk text — either by reading the doc or by ILIKE-sweeping for those specific terms.
+
+**Before declaring done — VERIFY and REVISE (not theatre).**
+
+Multiple studies show that a real *check → revise* loop materially improves deliverable accuracy on complex tasks. A superficial "I reviewed it and it looks good" does nothing; an actual revise-after-check loop catches the omissions that summary-triage and topical filtering miss. Before treating any deliverable as final:
+
+1. **Build an explicit checklist from the task prompt and matter description.** List every:
+   - Proper noun the prompt cites (party names, jurisdictions, named witnesses, named entities, named facilities or sites)
+   - Unique identifier (decision/regulation numbers, case numbers, exhibit IDs, statute references, specific contract numbers)
+   - Specific number or date the prompt anchors to (dollar amounts, dates of relevant events, document version numbers)
+   - Named deliverable section the prompt explicitly asks for
+
+2. **Audit your draft against the checklist.** For each item:
+   - Does the deliverable mention this specific entity / identifier?
+   - When the prompt cites a specific identifier (e.g., "Decision N", "Case No. X"), is your deliverable anchored to THAT identifier — not a similar-but-different one in the matter? Multi-entity matters often contain distractor identifiers; if your draft cites a different one than the prompt, that's a defect, not a stylistic choice.
+   - For named-entity facts: did you actually QUERY the chunks for THIS entity, or did you let your queries find it incidentally through topical filters? If you didn't explicitly query, you probably didn't find it.
+
+3. **REVISE — actually fix what the audit flagged.** This step has to produce concrete `inquisita_query` calls that surface the missed entity, then integrate the findings into the deliverable. The output of a real revise step is a longer, more specific deliverable — not the same draft with a "I have reviewed and confirm completeness" stamp.
+
+4. **Audit your audit.** If your verification step did not produce at least one new query and one concrete revision, your verification was theatre. Run the loop again with sharper attention to identifiers.
+
+The failure mode this exists to prevent: agent produces a topically-correct, well-structured deliverable that references the wrong specific identifier (because a similar distractor was more frequent in the chunks) or omits a specific named entity (because the entity name lives in a document the agent never queried). Both look fine on a skim. Both fail the rubric. Verify-and-revise catches both.
 
 Read `references/sql-patterns.md` for common query patterns and syntax.
 
@@ -90,9 +153,12 @@ This is the most powerful pattern and the one most likely to trip you up. Analys
 - `llm`: Send document content to an LLM with a prompt and output schema. Returns structured JSON per document.
 - `vector_similarity`: Compute cosine similarity against a reference query. Returns `similarity_score` and `is_match`.
 
-**Two levels:**
-- `document` (default): One result per file. Uses the document summary. Required for collection enrichments.
-- `chunk`: One result per chunk (page/section). Use for finding specific passages, extracting per-page data, or when you need granular results.
+**Two modes:**
+
+- **Chunk-level (default — what you almost always want):** one LLM call per chunk reading the chunk's full native content. Required for finding passages, page-level Q&A, citations, or any question whose answer might live in a specific section. Source SQL must return `source_file_id, chunk_index` (typically `SELECT source_file_id, chunk_index FROM chunks WHERE ...`). Results live in `analysis_results_chunk`.
+- **Summary-only (`config.summary_only: true` — explicit opt-in):** one LLM call per file reading ONLY the document's overall summary. Much faster and cheaper, but BLIND to anything not surfaced in the summary. Use only for bulk classification, document-level labels, or screening questions answerable from a short summary — never for finding passages or evidence. Source SQL returns `source_file_id` only (`SELECT source_file_id FROM documents WHERE ...`). Results live in `analysis_results_doc`.
+
+When in doubt, omit `summary_only` — chunk-level is the safer default for legal workflows.
 
 **Analysis Can Be Pricey:**
 - Running analysis jobs can be pricey, especially as intelligence goes up. If you're not sure whether your prompt or intelligence level is sufficient, test against a smaller subset of docs and analyze results before processing the whole set.
@@ -199,15 +265,21 @@ Two paths to get there:
 
 You can stack multiple enrichments on the same collection — run a relevance job and a privilege job, enrich with both, then query for documents that are high-relevance AND non-privileged. Each job's results are namespaced independently, so enrichments never collide.
 
-**Document-level vs chunk-level enrichment:**
+**How enrichments surface on `collection_members`:**
 
-Enrichments on collection members are always document-level — one enrichment record per document per job. This works cleanly for document-level analysis jobs (one result per file maps directly to one collection item).
+Each row of `collection_members` exposes two enrichment columns, both materialized at read time by joining `analysis_results` through the collection's `linked_job_ids`:
 
-For chunk-level analysis jobs, results are **auto-aggregated** to document level when enriching: booleans are OR'd (becomes `any_X` — true if ANY chunk was true), numbers are MAX'd (becomes `max_X` — the highest value across chunks), and enums collapse by priority order. This means you lose per-chunk granularity in the enrichment itself.
+- `chunk_enrichments` (JSONB) — populated from chunk-level analysis jobs, keyed on `(source_file_id, chunk_index)`. One value per chunk row in chunk-level collections.
+- `document_enrichments` (JSONB) — populated from summary-only analysis jobs, keyed on `source_file_id`. The file's value applies to every row of that file (so on a chunk-level collection, all chunks of the same file share the same `document_enrichments`).
 
-**When you need chunk-level detail within a collection**, don't rely on the aggregated enrichments. Instead, query the `collection_analysis` view, which gives you the raw per-chunk analysis results scoped to that collection's documents. This preserves full granularity — which chunk, which page, what the analysis found there.
+Both columns are flat JSONB maps; access fields with `chunk_enrichments->>'field_name'` or `document_enrichments->>'field_name'`. Multiple linked jobs are merged into the same map (field-name collisions are rejected at link time, so each field has exactly one source job).
 
-The practical split: use `collection_members` with enrichments for document-level filtering and sorting ("show me the top 10 most relevant documents"). Use `collection_analysis` when you need passage-level precision ("show me the specific pages that mention the March inspection").
+**Grain compatibility rule:** chunk-level analysis jobs can be linked only to chunk-level collections (linking to a document-level collection would fan out one row per chunk — the API rejects it). Summary-only jobs can be linked to either grain.
+
+**Practical guidance:**
+- For passage-level filtering inside a chunk-level collection, query `chunk_enrichments`.
+- For document-level filtering or sorting on either grain, query `document_enrichments`.
+- For per-document aggregates of a chunk-level collection (one row per file with chunk count), use the `collection_documents` view.
 
 **Collection types:** `
 
