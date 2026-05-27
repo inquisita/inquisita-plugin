@@ -2,6 +2,7 @@
 
 ## Table of Contents
 - Available Views (via discover)
+- Query Efficiency (the cap and the patterns that beat it)
 - Basic Document Queries
 - Semantic Search
 - Keyword Search
@@ -15,6 +16,70 @@
 Before writing SQL, call `inquisita_discover` with the `matter_id` to get the current list of available views and their columns. The schema may evolve as Inquisita adds features — `discover` always returns the live schema.
 
 For collections, call `inquisita_discover` with `collection_id` to see enrichment sources, their field names and types, and any highlights.
+
+## Query Efficiency
+
+Inquisita refuses query results larger than ~50,000 characters (~12K tokens). The cap is a forcing function: compute answers in the database, don't dump raw text back to your context. The pattern below is the one to avoid:
+
+```sql
+-- ❌ Dumps the whole document, forces you to read/grep it yourself
+SELECT text_content FROM chunks WHERE source_file_id = 'X'
+```
+
+When the cap fires you get a structured response with these four patterns. Reach for them *before* hitting the cap.
+
+### Snippet extraction
+Matched paragraph (±200 chars context), not the whole chunk. Use when you want to see the operative passage for a clause/term.
+
+```sql
+SELECT source_file_id, chunk_index,
+       substring(text_content,
+                 GREATEST(1, position('term' in lower(text_content)) - 200),
+                 600) AS snippet
+FROM chunks
+WHERE text_content ILIKE '%term%'
+LIMIT 50
+```
+
+### Multi-pattern presence matrix
+One query in place of N greps. Counts clause hits per document. Use when triaging which documents contain which clauses.
+
+```sql
+SELECT documents.file_name,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%assign%') AS n_assign,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%change of control%') AS n_coc,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%governing law%') AS n_gov
+FROM chunks
+JOIN documents USING (source_file_id)
+GROUP BY documents.file_name
+```
+
+### Files-with-matches
+Drop the text entirely; return only WHICH docs contain a term. Use when scoping which docs are worth opening.
+
+```sql
+SELECT DISTINCT source_file_id, file_name
+FROM chunks
+WHERE text_content ILIKE '%term%'
+```
+
+### Range slice
+Read part of one doc by chunk_index range. Use when drilling into a known section of a known doc.
+
+```sql
+SELECT chunk_index, text_content FROM chunks
+WHERE source_file_id = 'X' AND chunk_index BETWEEN 5 AND 15
+```
+
+### What grep can't do but SQL can
+- Joins across documents and analysis results
+- Aggregations (`COUNT`, `GROUP BY`, percentiles, statistical functions)
+- Window functions (`RANK`, `LAG`, `LEAD` over `chunk_index`)
+- JSONB metadata filtering (`metadata->>'field'`, `chunk_enrichments->>'field'`)
+- Regex extraction (`regexp_matches`, `substring(text from pattern)`)
+- Vector similarity ordering (no grep equivalent)
+
+If a query would still return >50K chars after applying these, narrow the WHERE further, add `LIMIT`, or call `inquisita_analyze` for structured extraction across many docs at once.
 
 ## Basic Document Queries
 
