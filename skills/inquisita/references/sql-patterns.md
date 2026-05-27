@@ -2,7 +2,8 @@
 
 ## Table of Contents
 - Available Views (via discover)
-- Query Efficiency (the cap and the patterns that beat it)
+- Reading documents (the default move)
+- Triage helpers (use when picking which docs to read)
 - Basic Document Queries
 - Semantic Search
 - Keyword Search
@@ -17,41 +18,46 @@ Before writing SQL, call `inquisita_discover` with the `matter_id` to get the cu
 
 For collections, call `inquisita_discover` with `collection_id` to see enrichment sources, their field names and types, and any highlights.
 
-## Query Efficiency
+## Reading documents
 
-Inquisita refuses query results larger than ~50,000 characters (~12K tokens). The cap is a forcing function: compute answers in the database, don't dump raw text back to your context. The pattern below is the one to avoid:
-
-```sql
--- ❌ Dumps the whole document, forces you to read/grep it yourself
-SELECT text_content FROM chunks WHERE source_file_id = 'X'
-```
-
-When the cap fires you get a structured response with these four patterns. Reach for them *before* hitting the cap.
-
-### Snippet extraction
-Matched paragraph (±200 chars context), not the whole chunk. Use when you want to see the operative passage for a clause/term.
+For most legal tasks, reading the relevant documents end-to-end is what produces accurate output. Don't try to derive answers from summaries or clever SQL aggregations alone. Treat the database as a workspace, not as expensive grep.
 
 ```sql
-SELECT source_file_id, chunk_index,
-       substring(text_content,
-                 GREATEST(1, position('term' in lower(text_content)) - 200),
-                 600) AS snippet
-FROM chunks
-WHERE text_content ILIKE '%term%'
-LIMIT 50
+-- Whole document in chunk order. Large results spill to disk; read the spill and proceed.
+SELECT chunk_index, text_content FROM chunks
+WHERE source_file_id = 'doc_X' ORDER BY chunk_index;
+
+-- A section of one document by chunk_index range
+SELECT chunk_index, text_content FROM chunks
+WHERE source_file_id = 'doc_X' AND chunk_index BETWEEN 5 AND 15;
 ```
+
+After triage narrows the relevant doc set, just read those docs. Reading a contract or memo end-to-end is exactly what an attorney would do.
+
+## Triage helpers
+
+Use these to narrow down WHICH documents you'll read — not as substitutes for reading.
 
 ### Multi-pattern presence matrix
-One query in place of N greps. Counts clause hits per document. Use when triaging which documents contain which clauses.
+One query in place of N greps. Counts term hits per document. Use when triaging which documents contain which clauses or named entities from the task prompt.
 
 ```sql
 SELECT documents.file_name,
-       COUNT(*) FILTER (WHERE text_content ILIKE '%assign%') AS n_assign,
-       COUNT(*) FILTER (WHERE text_content ILIKE '%change of control%') AS n_coc,
-       COUNT(*) FILTER (WHERE text_content ILIKE '%governing law%') AS n_gov
+       COUNT(*) FILTER (WHERE text_content ILIKE '%TERM_1%') AS hits_1,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%TERM_2%') AS hits_2,
+       COUNT(*) FILTER (WHERE text_content ILIKE '%TERM_3%') AS hits_3
 FROM chunks
 JOIN documents USING (source_file_id)
-GROUP BY documents.file_name
+GROUP BY documents.file_name;
+```
+
+### Full-text-search sweep
+For multi-term searches, FTS is concise:
+
+```sql
+SELECT DISTINCT source_file_id, file_name FROM chunks
+JOIN documents USING (source_file_id)
+WHERE search_text @@ websearch_to_tsquery('"TERM_1" OR "TERM_2"');
 ```
 
 ### Files-with-matches
@@ -60,26 +66,29 @@ Drop the text entirely; return only WHICH docs contain a term. Use when scoping 
 ```sql
 SELECT DISTINCT source_file_id, file_name
 FROM chunks
-WHERE text_content ILIKE '%term%'
+WHERE text_content ILIKE '%term%';
 ```
 
-### Range slice
-Read part of one doc by chunk_index range. Use when drilling into a known section of a known doc.
+### Snippet extraction
+Only the matched paragraph (±200 chars context), not the whole chunk. Use when you just want to see the operative passage for a clause/term and don't need surrounding context.
 
 ```sql
-SELECT chunk_index, text_content FROM chunks
-WHERE source_file_id = 'X' AND chunk_index BETWEEN 5 AND 15
+SELECT source_file_id, chunk_index,
+       substring(text_content,
+                 GREATEST(1, position('term' in lower(text_content)) - 200),
+                 600) AS snippet
+FROM chunks
+WHERE text_content ILIKE '%term%'
+LIMIT 50;
 ```
 
-### What grep can't do but SQL can
+### What SQL can do that grep can't
 - Joins across documents and analysis results
 - Aggregations (`COUNT`, `GROUP BY`, percentiles, statistical functions)
 - Window functions (`RANK`, `LAG`, `LEAD` over `chunk_index`)
 - JSONB metadata filtering (`metadata->>'field'`, `chunk_enrichments->>'field'`)
 - Regex extraction (`regexp_matches`, `substring(text from pattern)`)
 - Vector similarity ordering (no grep equivalent)
-
-If a query would still return >50K chars after applying these, narrow the WHERE further, add `LIMIT`, or call `inquisita_analyze` for structured extraction across many docs at once.
 
 ## Basic Document Queries
 
