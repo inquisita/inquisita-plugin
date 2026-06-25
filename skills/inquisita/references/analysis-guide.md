@@ -5,7 +5,7 @@
 - Writing Good Prompts
 - Output Schema Patterns
 - Intelligence Levels
-- Document vs Chunk Level
+- Chunk-Level vs Summary-Only
 - Polling and Error Handling
 - Scoping Jobs with SQL
 - Prompt Templates
@@ -143,27 +143,42 @@ Set via `config.intelligence`:
 
 Default to `low` for most classification tasks. Use `medium` when the prompt requires judgment or weighing multiple factors. Reserve `high` for genuinely complex analytical tasks.
 
-## Document vs Chunk Level
+## Chunk-Level vs Summary-Only
 
-Set via `config.level`:
+Two modes, controlled by the optional `config.summary_only` boolean. **Default is chunk-level** — the right choice for almost every legal workflow.
 
-**Document level** (`level: "document"`, default):
-- Uses the document's overall summary
-- One result per file
-- Required for collection enrichments
-- Good for: classification, relevance scoring, document-type identification
+### Chunk-level (default — omit `summary_only`, or set `false`)
 
-**Chunk level** (`level: "chunk"`):
-- Analyzes each chunk (page/section) independently
-- Many results per file (one per chunk)
-- Good for: finding specific passages, extracting per-page data, event extraction, locating evidence
-- Query results via `analysis_results_chunk` (includes `text_content` and `chunk_index`)
+- One LLM call per chunk reading the chunk's full native content (page/segment/clip)
+- Required for finding passages, page-level Q&A, citations, event extraction, or any task whose answer might live in a specific section
+- One result row per `(source_file_id, chunk_index)` pair
+- Source SQL must return `source_file_id` AND `chunk_index`:
+  ```sql
+  SELECT source_file_id, chunk_index FROM chunks WHERE media_type = 'document'
+  ```
+- Query results via `analysis_results_chunk` (includes `text_content`, `chunk_index`, `file_name`)
+- Enriches chunk-level collections naturally; results aggregated into `chunk_enrichments`
 
-When to use chunk-level:
-- Extracting events/dates from long documents
-- Finding specific clauses in contracts
-- Locating evidence within documents
-- Any task where you need to know WHERE in the document something appears
+### Summary-only (`config.summary_only: true` — explicit opt-in)
+
+- One LLM call per file reading ONLY the document's `overall_summary`
+- Much faster and cheaper, but BLIND to anything the summary omits — do **not** use for finding passages, citations, or detail-dependent questions
+- Appropriate for: bulk classification, document-typing, screening questions answerable from a short summary
+- Source SQL returns `source_file_id` only:
+  ```sql
+  SELECT source_file_id FROM documents WHERE file_name ILIKE '%contract%'
+  ```
+- Query results via `analysis_results_doc` (includes `file_name`, `media_type`, `overall_summary`)
+- Enriches both grain types; on chunk-level collections, the file's summary-only result propagates to every chunk row via `document_enrichments`
+
+### How this interacts with collections
+
+| Job mode | Can enrich document-level collection? | Can enrich chunk-level collection? |
+|----------|---------------------------------------|------------------------------------|
+| Chunk-level | ❌ (would fan-out) | ✅ joins on `(source_file_id, chunk_index)` |
+| Summary-only | ✅ joins on `source_file_id` | ✅ file's value applies to every chunk |
+
+If you're enriching a document-level collection, you must use `summary_only: true`.
 
 ## Polling and Error Handling
 
@@ -229,7 +244,7 @@ a one-sentence description, and which party or entity is primarily involved.
 [Include party names and roles for context.]
 ```
 Schema: `{"events": {"type": "array", "items": {"type": "object", "properties": {"date": {"type": "string"}, "description": {"type": "string"}, "party": {"type": "string"}}}}}`
-Level: `chunk` (to get per-page extraction)
+Mode: chunk-level (default — needed to extract events from each page)
 
 ### Privilege Review
 ```
